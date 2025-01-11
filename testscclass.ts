@@ -37,98 +37,131 @@ let receivedChunks: Map<number, Uint8Array> = new Map();
 let totalFrameSize = 0;
 let frameCount = 0;
 
-async function receiveFrame(): Promise<Uint8Array | null> {
-    try {
-        // Receive metadata packet first (8 bytes: 4 for size, 4 for chunk count)
-        console.log("Waiting for metadata packet...");
-        const [metadata] = await listener.receive();
-        console.log("Received metadata packet, size:", metadata.length);
-        
-        const dataView = new DataView(metadata.buffer);
-        totalFrameSize = dataView.getUint32(0, true);
-        expectedChunks = dataView.getUint32(4, true);
-        
-        console.log(`Frame ${frameCount++}: Expecting ${totalFrameSize} bytes in ${expectedChunks} chunks`);
-        receivedChunks.clear();
+// Constants
+const CHUNK_SIZE = 60000; // Must match Rust's CHUNK_SIZE
+const METADATA_SIZE = 8;  // 4 bytes for total size + 4 bytes for chunk count
+const CHUNK_HEADER_SIZE = 4; // 4 bytes for chunk index
 
-        // Receive all chunks
-        console.log("Starting to receive chunks...");
-        let totalBytesReceived = 0;
+function extractChunksFromPacket(packet: Uint8Array): { index: number, data: Uint8Array }[] {
+    const chunks: { index: number, data: Uint8Array }[] = [];
+    let offset = 0;
 
-        for (let i = 0; i < expectedChunks; i++) {
-            console.log(`Waiting for chunk ${i}...`);
-            const [chunkData] = await listener.receive();
-            
-            // First 4 bytes are the chunk index
-            const chunkView = new DataView(chunkData.buffer);
-            const chunkIndex = chunkView.getUint32(0, true);
-            
-            // Rest is the actual chunk data
-            const chunk = new Uint8Array(chunkData.buffer, 4, chunkData.length - 4);
-            console.log(`Received chunk ${chunkIndex}: size=${chunk.length}, total=${chunkData.length}`);
-            
-            totalBytesReceived += chunk.length;
-            receivedChunks.set(chunkIndex, chunk);
-        }
+    while (offset < packet.length) {
+        // Need at least 4 bytes for the chunk index
+        if (offset + CHUNK_HEADER_SIZE > packet.length) break;
 
-        console.log(`Received ${receivedChunks.size} chunks, total bytes: ${totalBytesReceived}`);
-        
-        // Combine chunks into final frame
-        if (receivedChunks.size === expectedChunks) {
-            const frameData = new Uint8Array(totalFrameSize);
-            let offset = 0;
-            
-            for (let i = 0; i < expectedChunks; i++) {
-                const chunk = receivedChunks.get(i);
-                if (!chunk) {
-                    console.log(`Missing chunk ${i}!`);
-                    continue;
-                }
-                
-                // Ensure we don't write past the buffer
-                const remainingSpace = totalFrameSize - offset;
-                const bytesToCopy = Math.min(chunk.length, remainingSpace);
-                
-                if (bytesToCopy < chunk.length) {
-                    console.log(`Warning: Truncating chunk ${i} from ${chunk.length} to ${bytesToCopy} bytes`);
-                }
-                
-                frameData.set(chunk.subarray(0, bytesToCopy), offset);
-                offset += bytesToCopy;
-            }
+        // Extract chunk index
+        const index = new DataView(packet.buffer, packet.byteOffset + offset, 4).getUint32(0, true);
+        offset += CHUNK_HEADER_SIZE;
 
-            console.log(`Frame ${frameCount}: Reconstructed ${offset}/${totalFrameSize} bytes`);
-            
-            // Verify first few pixels to ensure data looks correct
-            console.log(`First pixel: R=${frameData[0]}, G=${frameData[1]}, B=${frameData[2]}, A=${frameData[3]}`);
-            
-            if (offset === totalFrameSize) {
-                return frameData;
-            } else {
-                console.log(`Frame size mismatch: got ${offset}, expected ${totalFrameSize}`);
-                return null;
-            }
-        } else {
-            console.log(`Frame ${frameCount}: Missing chunks, only received ${receivedChunks.size}/${expectedChunks}`);
-        }
-    } catch (error) {
-        console.error("Error receiving frame:", error);
-        if (error instanceof Deno.errors.BadResource) {
-            console.error("UDP socket error - trying to recreate listener");
-            try {
-                listener.close();
-                listener = Deno.listenDatagram({
-                    port: 12345,
-                    transport: "udp",
-                    hostname: "127.0.0.1",
-                });
-            } catch (e) {
-                console.error("Failed to recreate listener:", e);
-            }
-        }
+        // Calculate remaining data in packet
+        const remainingBytes = packet.length - offset;
+        if (remainingBytes <= 0) break;
+
+        // Extract chunk data
+        const chunkSize = Math.min(remainingBytes, CHUNK_SIZE);
+        const data = new Uint8Array(packet.buffer, packet.byteOffset + offset, chunkSize);
+        offset += chunkSize;
+
+        chunks.push({ index, data });
     }
 
-    return null;
+    return chunks;
+}
+
+async function receiveFrame(): Promise<Uint8Array | null> {
+    try {
+        // Wait for metadata packet
+        console.log("Waiting for metadata packet...");
+        const [metadata, _] = await listener.receive();
+        if (!metadata || metadata.length < METADATA_SIZE) {
+            console.log("Invalid metadata received");
+            return null;
+        }
+        
+        // Parse metadata
+        const totalSize = new DataView(metadata.buffer).getUint32(0, true);
+        const numChunks = new DataView(metadata.buffer).getUint32(4, true);
+
+        if (numChunks > 1000 || totalSize > 1920 * 1080 * 4) {
+            console.log(`Invalid metadata: size=${totalSize}, chunks=${numChunks}`);
+            // Reset socket buffer
+            while (await listener.receive()) {}
+            return null;
+        }
+
+        console.log(`Frame ${frameCount}: Expecting ${totalSize} bytes in ${numChunks} chunks`);
+        console.log("Starting to receive chunks...");
+
+        // Create buffer for the entire frame
+        const frameData = new Uint8Array(totalSize);
+        const receivedChunks = new Set<number>();
+        let totalReceived = 0;
+
+        // Receive all chunks with timeout
+        const startTime = performance.now();
+        const TIMEOUT = 1000; // 1 second timeout
+
+        while (receivedChunks.size < numChunks) {
+            if (performance.now() - startTime > TIMEOUT) {
+                console.log(`Frame ${frameCount}: Timeout waiting for chunks`);
+                // Reset socket buffer
+                while (await listener.receive()) {}
+                return null;
+            }
+
+            const [packetData, _] = await listener.receive();
+            if (!packetData || packetData.length < CHUNK_HEADER_SIZE) continue;
+
+            // Extract all chunks from the packet
+            const chunks = extractChunksFromPacket(packetData);
+            
+            for (const { index: chunkIndex, data: chunkData } of chunks) {
+                if (chunkIndex >= numChunks) {
+                    console.log(`Invalid chunk index: ${chunkIndex} >= ${numChunks}`);
+                    continue;
+                }
+
+                // Debug log for first chunk of each frame
+                if (chunkIndex === 0) {
+                    console.log(`First chunk: index=${chunkIndex}, size=${chunkData.length}`);
+                }
+
+                if (!receivedChunks.has(chunkIndex)) {
+                    const offset = chunkIndex * CHUNK_SIZE;
+                    const expectedSize = Math.min(CHUNK_SIZE, totalSize - offset);
+                    
+                    if (chunkData.length > expectedSize) {
+                        console.log(`Warning: Chunk ${chunkIndex} is too large (${chunkData.length} > ${expectedSize})`);
+                        continue;
+                    }
+
+                    frameData.set(chunkData, offset);
+                    receivedChunks.add(chunkIndex);
+                    totalReceived += chunkData.length;
+
+                    // Progress logging
+                    if (receivedChunks.size % 10 === 0) {
+                        console.log(`Progress: ${receivedChunks.size}/${numChunks} chunks`);
+                    }
+                }
+            }
+        }
+
+        if (totalReceived !== totalSize) {
+            console.log(`Frame ${frameCount}: Size mismatch, received ${totalReceived}/${totalSize} bytes`);
+            return null;
+        }
+
+        // Debug log for first pixel
+        console.log(`First pixel: R=${frameData[0]}, G=${frameData[1]}, B=${frameData[2]}, A=${frameData[3]}`);
+
+        frameCount++;
+        return frameData;
+    } catch (error) {
+        console.error("Error receiving frame:", error);
+        return null;
+    }
 }
 
 function loadShader(type: number, src: string) {
@@ -271,13 +304,20 @@ function createTextureFromScreenshot(pixels: Uint8Array): number {
     return texture[0];
 }
 
+// Frame timing state
+//let frameCount = 0;
+let lastFpsUpdate = performance.now();
+let framesThisSecond = 0;
+let currentFps = 0;
+
 async function frame() {
+    const frameStart = performance.now();
+    
     // Receive new frame data
     const frameData = await receiveFrame();
     
     if (frameData) {
         currentTexture = createTextureFromScreenshot(frameData);
-        console.log(`Created texture: ${currentTexture}`);
     }
     
     // Clear and draw
@@ -300,15 +340,21 @@ async function frame() {
         
         // Draw fullscreen quad
         gl.DrawArrays(gl.TRIANGLE_STRIP, 0, 4);
-        
-        // Check for GL errors
-        const error = gl.GetError();
-        if (error !== gl.NO_ERROR) {
-            console.error(`GL error after draw: 0x${error.toString(16)}`);
-        }
     }
     
     window.swapBuffers();
+
+    // Update FPS counter
+    frameCount++;
+    framesThisSecond++;
+    
+    const now = performance.now();
+    if (now - lastFpsUpdate >= 1000) {
+        currentFps = framesThisSecond;
+        console.log(`🎬 Display FPS: ${currentFps} (frame time: ${((now - frameStart) / framesThisSecond).toFixed(1)}ms)`);
+        framesThisSecond = 0;
+        lastFpsUpdate = now;
+    }
 }
 
 // Cleanup function
