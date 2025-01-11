@@ -116,11 +116,14 @@ fn main() {
 
                 // Send the frame data in chunks
                 for (chunk_index, chunk) in rgba_data.chunks(CHUNK_SIZE).enumerate() {
-                    // Prepend chunk index to the data
-                    let chunk_data = [
-                        (chunk_index as u32).to_le_bytes().to_vec(),
-                        chunk.to_vec(),
-                    ].concat();
+                    // Create chunk data with index prefix
+                    let index_bytes = (chunk_index as u32).to_le_bytes();
+                    let mut chunk_data = Vec::with_capacity(4 + chunk.len());
+                    chunk_data.extend_from_slice(&index_bytes);
+                    chunk_data.extend_from_slice(chunk);
+
+                    println!("📦 Chunk {}: data_size={}, total_size={}", 
+                        chunk_index, chunk.len(), chunk_data.len());
 
                     if let Err(e) = socket.send_to(&chunk_data, &sock_addr) {
                         println!("❌ Error sending chunk {}: {:?}", chunk_index, e);
@@ -131,7 +134,7 @@ fn main() {
                     sleep(Duration::from_millis(CHUNK_DELAY_MS));
 
                     if chunk_index % 10 == 0 {
-                        println!("📦 Sent chunk {}/{}", chunk_index, num_chunks);
+                        println!("📦 Progress: {}/{}", chunk_index, num_chunks);
                     }
                 }
 

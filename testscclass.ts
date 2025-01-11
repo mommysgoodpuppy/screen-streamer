@@ -53,19 +53,25 @@ async function receiveFrame(): Promise<Uint8Array | null> {
 
         // Receive all chunks
         console.log("Starting to receive chunks...");
+        let totalBytesReceived = 0;
+
         for (let i = 0; i < expectedChunks; i++) {
             console.log(`Waiting for chunk ${i}...`);
             const [chunkData] = await listener.receive();
-            console.log(`Received chunk data, size: ${chunkData.length}`);
             
+            // First 4 bytes are the chunk index
             const chunkView = new DataView(chunkData.buffer);
             const chunkIndex = chunkView.getUint32(0, true);
-            const chunk = new Uint8Array(chunkData.buffer.slice(4));
-            console.log(`Processing chunk ${chunkIndex}, size: ${chunk.length}`);
+            
+            // Rest is the actual chunk data
+            const chunk = new Uint8Array(chunkData.buffer, 4, chunkData.length - 4);
+            console.log(`Received chunk ${chunkIndex}: size=${chunk.length}, total=${chunkData.length}`);
+            
+            totalBytesReceived += chunk.length;
             receivedChunks.set(chunkIndex, chunk);
         }
 
-        console.log(`Received ${receivedChunks.size} chunks, combining...`);
+        console.log(`Received ${receivedChunks.size} chunks, total bytes: ${totalBytesReceived}`);
         
         // Combine chunks into final frame
         if (receivedChunks.size === expectedChunks) {
@@ -78,15 +84,30 @@ async function receiveFrame(): Promise<Uint8Array | null> {
                     console.log(`Missing chunk ${i}!`);
                     continue;
                 }
-                frameData.set(chunk, offset);
-                offset += chunk.length;
+                
+                // Ensure we don't write past the buffer
+                const remainingSpace = totalFrameSize - offset;
+                const bytesToCopy = Math.min(chunk.length, remainingSpace);
+                
+                if (bytesToCopy < chunk.length) {
+                    console.log(`Warning: Truncating chunk ${i} from ${chunk.length} to ${bytesToCopy} bytes`);
+                }
+                
+                frameData.set(chunk.subarray(0, bytesToCopy), offset);
+                offset += bytesToCopy;
             }
 
             console.log(`Frame ${frameCount}: Reconstructed ${offset}/${totalFrameSize} bytes`);
             
             // Verify first few pixels to ensure data looks correct
             console.log(`First pixel: R=${frameData[0]}, G=${frameData[1]}, B=${frameData[2]}, A=${frameData[3]}`);
-            return frameData;
+            
+            if (offset === totalFrameSize) {
+                return frameData;
+            } else {
+                console.log(`Frame size mismatch: got ${offset}, expected ${totalFrameSize}`);
+                return null;
+            }
         } else {
             console.log(`Frame ${frameCount}: Missing chunks, only received ${receivedChunks.size}/${expectedChunks}`);
         }
