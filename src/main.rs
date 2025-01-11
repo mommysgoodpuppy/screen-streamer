@@ -8,7 +8,7 @@ use std::sync::mpsc;
 use std::thread;
 
 const CHUNK_SIZE: usize = 60000; // Slightly less than the maximum UDP packet size
-const CHUNK_DELAY_MS: u64 = 5; // Increased delay between chunks to prevent coalescing
+const CHUNK_DELAY_MS: u64 = 2; // Small delay between chunks
 const TARGET_FPS: u64 = 30;
 const FRAME_TIME_MS: u64 = 1000 / TARGET_FPS;
 

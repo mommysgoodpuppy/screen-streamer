@@ -287,25 +287,18 @@ function createTextureFromScreenshot(pixels: Uint8Array): number {
         gl.TEXTURE_2D,
         0,
         gl.RGBA,
-        1280,
-        720,
+        1280,  // Fixed width from Rust
+        720,   // Fixed height from Rust
         0,
         gl.RGBA,
         gl.UNSIGNED_BYTE,
         pixels
     );
     
-    // Check for GL errors
-    const error = gl.GetError();
-    if (error !== gl.NO_ERROR) {
-        console.error(`GL error after texture creation: 0x${error.toString(16)}`);
-    }
-    
     return texture[0];
 }
 
 // Frame timing state
-//let frameCount = 0;
 let lastFpsUpdate = performance.now();
 let framesThisSecond = 0;
 let currentFps = 0;
@@ -345,7 +338,6 @@ async function frame() {
     window.swapBuffers();
 
     // Update FPS counter
-    frameCount++;
     framesThisSecond++;
     
     const now = performance.now();
