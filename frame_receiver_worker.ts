@@ -25,41 +25,36 @@ async function readExactly(size: number): Promise<Uint8Array | null> {
   }
 }
 
-async function receiveFrame(): Promise<Uint8Array | null> {
-  const METADATA_SIZE = 8; // 4 bytes for total size + 4 bytes for chunk count
-  try {
-    // Read metadata
-    const metadataBuffer = await readExactly(METADATA_SIZE);
-    if (!metadataBuffer) return null;
+async function receiveFrame(): Promise<{ data: Uint8Array; width: number; height: number } | null> {
+  // Read metadata (width, height, size, chunks)
+  const metadata = await readExactly(16); // 4 x 32-bit values
+  if (!metadata) return null;
 
-    // Parse metadata
-    const totalSize = new DataView(metadataBuffer.buffer).getUint32(0, true);
-    const numChunks = new DataView(metadataBuffer.buffer).getUint32(4, true);
+  const width = new DataView(metadata.buffer).getUint32(0, true);
+  const height = new DataView(metadata.buffer).getUint32(4, true);
+  const totalSize = new DataView(metadata.buffer).getUint32(8, true);
+  const numChunks = new DataView(metadata.buffer).getUint32(12, true);
 
-    // Create buffer for the entire frame
-    const frameData = new Uint8Array(totalSize);
-    let totalReceived = 0;
+  // Allocate frame buffer
+  const frameData = new Uint8Array(totalSize);
+  let offset = 0;
 
-    // Read all chunks
-    for (let i = 0; i < numChunks; i++) {
-      // Read chunk size
-      const sizeBuffer = await readExactly(4);
-      if (!sizeBuffer) return null;
-      const chunkSize = new DataView(sizeBuffer.buffer).getUint32(0, true);
+  // Read all chunks
+  for (let i = 0; i < numChunks; i++) {
+    // Read chunk size
+    const chunkSizeData = await readExactly(4);
+    if (!chunkSizeData) return null;
+    const chunkSize = new DataView(chunkSizeData.buffer).getUint32(0, true);
 
-      // Read chunk data
-      const chunkData = await readExactly(chunkSize);
-      if (!chunkData) return null;
+    // Read chunk data
+    const chunk = await readExactly(chunkSize);
+    if (!chunk) return null;
 
-      frameData.set(chunkData, totalReceived);
-      totalReceived += chunkSize;
-    }
-
-    return frameData;
-  } catch (error) {
-    console.error("Frame receive error:", error);
-    return null;
+    frameData.set(chunk, offset);
+    offset += chunk.length;
   }
+
+  return { data: frameData, width, height };
 }
 
 async function startReceiving() {
@@ -68,7 +63,13 @@ async function startReceiving() {
     const frame = await receiveFrame();
     if (frame) {
       const receiveTime = performance.now() - frameStart;
-      worker.postMessage({ type: 'frame', data: frame, receiveTime });
+      worker.postMessage({ 
+        type: 'frame', 
+        data: frame.data,
+        width: frame.width,
+        height: frame.height,
+        receiveTime 
+      });
     }
     // Small delay to prevent tight loop
     await new Promise(resolve => setTimeout(resolve, 1));

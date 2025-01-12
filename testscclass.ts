@@ -24,8 +24,13 @@ gl.ClearColor(0.2, 0.3, 0.3, 1.0);
 gl.Enable(gl.BLEND);
 gl.BlendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
 
-// Initialize screen capturer
-const capturer = new ScreenCapturer();
+// Initialize screen capturer with stats callback
+const capturer = new ScreenCapturer({
+  debug: false,
+  onStats: ({ fps, avgLatency }) => {
+    console.log(`Capture FPS: ${fps.toFixed(1)} | Latency: ${avgLatency.toFixed(1)}ms`);
+  }
+});
 
 // Simple vertex shader
 const vShaderSrc = `#version 300 es
@@ -95,8 +100,10 @@ const texCoords = new Float32Array([
 ]);
 
 let currentTexture: number | null = null;
+let currentWidth = 0;
+let currentHeight = 0;
 
-function createTextureFromScreenshot(pixels: Uint8Array): number {
+function createTextureFromScreenshot(pixels: Uint8Array, width: number, height: number): number {
   // Delete old texture if it exists
   if (currentTexture !== null) {
     const textures = new Uint32Array([currentTexture]);
@@ -114,18 +121,22 @@ function createTextureFromScreenshot(pixels: Uint8Array): number {
   gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
   gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
 
-  // Upload texture data
+  // Upload texture data with dynamic dimensions
   gl.TexImage2D(
     gl.TEXTURE_2D,
     0,
     gl.RGBA,
-    1280,  // Fixed width from Rust
-    720,   // Fixed height from Rust
+    width,
+    height,
     0,
     gl.RGBA,
     gl.UNSIGNED_BYTE,
     pixels
   );
+
+  // Store current dimensions
+  currentWidth = width;
+  currentHeight = height;
 
   return texture[0];
 }
@@ -167,19 +178,21 @@ let framesThisSecond = 0;
 let currentFps = 0;
 
 async function frame() {
-  await new Promise(resolve => setTimeout(resolve, 100));
   const frameStart = performance.now();
 
   // Get latest frame from capturer
-  const frameData = capturer.getLatestFrame();
+  const frameData = await capturer.getLatestFrame();
 
   if (frameData) {
-    //console.log(`Received frame: ${frameData.length} bytes`);
-    currentTexture = createTextureFromScreenshot(frameData);
+    currentTexture = createTextureFromScreenshot(frameData.data, frameData.width, frameData.height);
+
+    // Update viewport to match frame dimensions
+    gl.Viewport(0, 0, frameData.width, frameData.height);
 
     // Clear and draw
     gl.Clear(gl.COLOR_BUFFER_BIT);
 
+    // Use shader program
     gl.UseProgram(program);
 
     // Set up position attribute
@@ -194,52 +207,47 @@ async function frame() {
     gl.ActiveTexture(gl.TEXTURE0);
     gl.BindTexture(gl.TEXTURE_2D, currentTexture);
 
-    // Draw fullscreen quad
+    // Draw quad
     gl.DrawArrays(gl.TRIANGLE_STRIP, 0, 4);
 
     window.swapBuffers();
-  }
+  
 
   // Add small delay to prevent thread starvation
 
 
-  // Update FPS counter
-  framesThisSecond++;
-
-  const now = performance.now();
-  if (now - lastFpsUpdate >= 1000) {
-    currentFps = framesThisSecond;
-    const frameTime = (now - frameStart) / framesThisSecond;
-
-    console.log(
-      `Display FPS: ${currentFps} | Frame time: ${frameTime.toFixed(1)}ms`
-    );
-
-    framesThisSecond = 0;
-    lastFpsUpdate = now;
+    // Update FPS counter
+    framesThisSecond++;
+    const now = performance.now();
+    if (now - lastFpsUpdate >= 1000) {
+      currentFps = framesThisSecond;
+      framesThisSecond = 0;
+      lastFpsUpdate = now;
+      window.title = `Screen Capture Test - Render FPS: ${currentFps}`;
+    }
   }
+
+  // Small delay to prevent tight loop
+  await new Promise(resolve => setTimeout(resolve, 1));
 }
 
 // Cleanup function
-function cleanup() {
+async function cleanup() {
   if (currentTexture !== null) {
     const textures = new Uint32Array([currentTexture]);
     gl.DeleteTextures(1, textures);
+    currentTexture = null;
   }
-  gl.DeleteProgram(program);
-  gl.DeleteShader(vShader);
-  gl.DeleteShader(fShader);
-  capturer.stop();
+
+  if (program) {
+    gl.DeleteProgram(program);
+  }
+
+  await capturer.dispose();
 }
 
 // Handle cleanup on exit
 globalThis.addEventListener("unload", cleanup);
 
 console.log("Starting screen capture test...");
-try {
-  await capturer.start();
-  await mainloop(frame);
-} catch (error) {
-  console.error("Error in main loop:", error);
-  cleanup();
-}
+mainloop(frame);

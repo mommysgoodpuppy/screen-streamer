@@ -148,7 +148,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
       // Send frame metadata
       let total_size = frame_data.len() as u32;
       let num_chunks = ((total_size as usize + CHUNK_SIZE - 1) / CHUNK_SIZE) as u32;
-      let metadata = [total_size.to_le_bytes(), num_chunks.to_le_bytes()].concat();
+      let metadata = [
+        width.to_le_bytes(),
+        height.to_le_bytes(),
+        total_size.to_le_bytes(),
+        num_chunks.to_le_bytes()
+      ].concat();
 
       if let Err(e) = socket.write_all(&metadata) {
         println!("\n❌ Connection error on metadata: {:?}", e);
