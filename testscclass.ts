@@ -24,7 +24,7 @@ gl.Enable(gl.BLEND);
 gl.BlendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
 
 // Constants
-const CHUNK_SIZE = 512 * 1024; // Match Rust's chunk size
+const CHUNK_SIZE = 256 * 1024; // 256KB chunks to match Rust
 const METADATA_SIZE = 8;  // 4 bytes for total size + 4 bytes for chunk count
 const FRAME_TIMEOUT_MS = 1000; // Timeout for receiving a frame
 
@@ -49,13 +49,7 @@ async function readExactly(conn: Deno.Conn, size: number): Promise<Uint8Array | 
     const buffer = new Uint8Array(size);
     let totalRead = 0;
     
-    const startTime = performance.now();
     while (totalRead < size) {
-        // Check for timeout
-        if (performance.now() - startTime > FRAME_TIMEOUT_MS) {
-            throw new Error("Timeout while reading data");
-        }
-
         const bytesRead = await conn.read(buffer.subarray(totalRead));
         if (!bytesRead) return null; // Connection closed
         totalRead += bytesRead;
@@ -91,13 +85,13 @@ async function receiveFrame(): Promise<Uint8Array | null> {
 
         // Read all chunks
         for (let i = 0; i < numChunks; i++) {
-            // Read combined chunk header and data
-            const chunkHeader = await readExactly(conn, 4);
-            if (!chunkHeader) {
-                throw new Error("Connection closed while reading chunk header");
+            // Read chunk size
+            const sizeBuffer = await readExactly(conn, 4);
+            if (!sizeBuffer) {
+                throw new Error("Connection closed while reading chunk size");
             }
+            const chunkSize = new DataView(sizeBuffer.buffer).getUint32(0, true);
             
-            const chunkSize = new DataView(chunkHeader.buffer).getUint32(0, true);
             if (chunkSize > CHUNK_SIZE || chunkSize > (totalSize - totalReceived)) {
                 throw new Error(`Invalid chunk size: ${chunkSize}`);
             }
@@ -110,6 +104,11 @@ async function receiveFrame(): Promise<Uint8Array | null> {
 
             frameData.set(chunkData, totalReceived);
             totalReceived += chunkSize;
+
+            // Debug info for first frame
+            if (frameCount === 0 && i === 0) {
+                console.log(`First chunk received: ${chunkSize} bytes`);
+            }
         }
 
         if (totalReceived !== totalSize) {

@@ -8,11 +8,10 @@ use std::sync::mpsc;
 use std::thread;
 use std::collections::VecDeque;
 
-const CHUNK_SIZE: usize = 512 * 1024; // Increased chunk size for faster sending
+const CHUNK_SIZE: usize = 256 * 1024; // 256KB chunks
 const TARGET_FPS: u64 = 60;
 const FRAME_TIME_MS: u64 = 1000 / TARGET_FPS;
-const MIN_FRAME_TIME_MS: u64 = (FRAME_TIME_MS as f64 * 0.8) as u64; // Allow slightly faster frames
-const MAX_FRAME_LAG_MS: u64 = 8; // Keep aggressive frame dropping
+const MAX_FRAME_LAG_MS: u64 = 8; // Super aggressive frame dropping
 
 fn bgra_to_rgba(bgra: &[u8]) -> Vec<u8> {
     let mut rgba = Vec::with_capacity(bgra.len());
@@ -57,10 +56,6 @@ fn main() {
             return;
         }
     }
-
-    // Set TCP socket options for better performance
-    socket.set_nodelay(true).unwrap(); // Disable Nagle's algorithm
-    socket.set_send_buffer_size(1024 * 1024).unwrap(); // 1MB send buffer
 
     // Create Options for screen capture
     let options = Options {
@@ -139,8 +134,7 @@ fn main() {
                     };
 
                     // Check if we should drop this frame
-                    let frame_time = frame_start.duration_since(last_frame_time).as_millis() as u64;
-                    if frame_time < MIN_FRAME_TIME_MS {
+                    if (frame_start.duration_since(last_frame_time).as_millis() as u64) < FRAME_TIME_MS {
                         dropped_frames += 1;
                         continue;
                     }
@@ -174,14 +168,17 @@ fn main() {
             // Send the frame data in chunks
             let mut send_error = false;
             for chunk in frame_data.chunks(CHUNK_SIZE) {
-                // Send chunk size and data together
+                // Send chunk size first
                 let chunk_size = chunk.len() as u32;
-                let mut chunk_data = Vec::with_capacity(4 + chunk.len());
-                chunk_data.extend_from_slice(&chunk_size.to_le_bytes());
-                chunk_data.extend_from_slice(chunk);
-                
-                if let Err(e) = socket.send(&chunk_data) {
-                    println!("\n❌ Connection error: {:?}", e);
+                if let Err(e) = socket.send(&chunk_size.to_le_bytes()) {
+                    println!("\n❌ Connection error on chunk size: {:?}", e);
+                    send_error = true;
+                    break;
+                }
+
+                // Then send chunk data
+                if let Err(e) = socket.send(chunk) {
+                    println!("\n❌ Connection error on chunk data: {:?}", e);
                     send_error = true;
                     break;
                 }
@@ -216,10 +213,10 @@ fn main() {
             }
         }
 
-        // Only sleep if we're ahead by a significant margin
+        // Only sleep if we're ahead of schedule
         let frame_duration = frame_start.elapsed().as_millis() as u64;
-        if frame_duration + 2 < FRAME_TIME_MS {  // Leave 2ms margin
-            sleep(Duration::from_millis(FRAME_TIME_MS - frame_duration - 2));
+        if frame_duration < FRAME_TIME_MS {
+            sleep(Duration::from_millis(FRAME_TIME_MS - frame_duration));
         }
     }
 
