@@ -1,3 +1,5 @@
+//#region typings
+
 /**
  * Interface representing a captured frame with its dimensions and timing information
  */
@@ -26,6 +28,8 @@ export interface ScreenCapturerOptions {
   onStats?: (stats: { fps: number; avgLatency: number }) => void;
 }
 
+//#endregion
+
 /**
  * ScreenCapturer provides a high-level interface for capturing screen content.
  * It manages the screen capture process and provides easy access to the latest frame.
@@ -46,6 +50,7 @@ export interface ScreenCapturerOptions {
  * ```
  */
 export class ScreenCapturer {
+//#region privates
   private process: Deno.ChildProcess | null = null;
   private worker: Worker | null = null;
   private frameData: CapturedFrame | null = null;
@@ -54,7 +59,7 @@ export class ScreenCapturer {
   private isStarted = false;
   private options: Required<ScreenCapturerOptions>;
   private startPromise: Promise<void> | null = null;
-
+//#endregion
   /**
    * Creates a new ScreenCapturer instance and automatically starts the capture process.
    * @param options Configuration options for the capturer

@@ -95,7 +95,7 @@ worker.onmessage = async (e: MessageEvent) => {
       worker.postMessage({ type: 'connected' });
       startReceiving();
     } catch (err) {
-      worker.postMessage({ type: 'error', error: err.message });
+      worker.postMessage({ type: 'error', error: (err as Error).message });
     }
   } else if (type === 'stop') {
     isConnected = false;

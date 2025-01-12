@@ -178,7 +178,7 @@ let framesThisSecond = 0;
 let currentFps = 0;
 
 async function frame() {
-  const frameStart = performance.now();
+
 
   // Get latest frame from capturer
   const frameData = await capturer.getLatestFrame();
