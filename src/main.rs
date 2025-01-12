@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 const CHUNK_SIZE: usize = 256 * 1024; // 256KB chunks
 const TARGET_FPS: u64 = 60;
 const FRAME_TIME_MS: u64 = 1000 / TARGET_FPS;
+const USE_RGBA_CONVERSION: bool = false; // Toggle BGRA to RGBA conversion
 
 fn bgra_to_rgba(bgra: &[u8]) -> Vec<u8> {
   let mut rgba = Vec::with_capacity(bgra.len());
@@ -132,7 +133,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
           }
 
           // Convert and store the frame
-          current_frame = Some(bgra_to_rgba(&bgra_data));
+          current_frame = Some(if USE_RGBA_CONVERSION {
+            bgra_to_rgba(&bgra_data)
+          } else {
+            bgra_data.to_vec()
+          });
           is_sending = true;
         }
         Err(e) => {

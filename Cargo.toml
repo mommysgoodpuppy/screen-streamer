@@ -1,0 +1,9 @@
+[package]
+name = "screen-streamer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+scap = "0.0.8"
+socket2 = "0.5.5"
+flate2 = "1.0.26"
