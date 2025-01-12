@@ -141,6 +141,7 @@ fn main() {
           // Convert and store the frame
           current_frame = Some(bgra_to_rgba(&bgra_data));
           is_sending = true;
+          //println!("📸 Captured frame: {} bytes", bgra_data.len());
         }
         Err(e) => {
           println!("\n❌ Error getting frame: {:?}", e);
@@ -156,14 +157,16 @@ fn main() {
       let num_chunks = ((total_size as usize + CHUNK_SIZE - 1) / CHUNK_SIZE) as u32;
       let metadata = [total_size.to_le_bytes(), num_chunks.to_le_bytes()].concat();
 
+      //println!("📤 Sending frame: {} bytes in {} chunks", total_size, num_chunks);
+
       if let Err(e) = socket.send(&metadata) {
-        println!("\n❌ Connection error: {:?}", e);
+        println!("\n❌ Connection error on metadata: {:?}", e);
         break;
       }
 
       // Send the frame data in chunks
       let mut send_error = false;
-      for chunk in frame_data.chunks(CHUNK_SIZE) {
+      for (i, chunk) in frame_data.chunks(CHUNK_SIZE).enumerate() {
         // Send chunk size first
         let chunk_size = chunk.len() as u32;
         if let Err(e) = socket.send(&chunk_size.to_le_bytes()) {
@@ -178,11 +181,15 @@ fn main() {
           send_error = true;
           break;
         }
+
+        //println!("  📦 Sent chunk {}/{}: {} bytes", i + 1, num_chunks, chunk_size);
       }
 
       if send_error {
         break;
       }
+
+      //println!("✅ Frame sent successfully");
 
       frame_count += 1;
       last_frame_time = Instant::now();
@@ -195,10 +202,7 @@ fn main() {
         let drop_rate = (dropped_frames as f64 / total_frames as f64) * 100.0;
         let latency = frame_start.elapsed().as_millis() as f64;
 
-        print!(
-          "\r🎬 FPS: {:.1} | Latency: {:.1}ms | Dropped: {}/{} ({:.1}%)    ",
-          current_fps, latency, dropped_frames, total_frames, drop_rate
-        );
+        print!("\r🎬 FPS: {:.1} | Latency: {:.1}ms | Dropped: {}/{} ({:.1}%)    ", current_fps, latency, dropped_frames, total_frames, drop_rate);
         io::stdout().flush().unwrap();
 
         frame_count = 0;
