@@ -6,11 +6,13 @@ use std::time::{Duration, Instant};
 use std::io::{self, Write};
 use std::sync::mpsc;
 use std::thread;
+use std::collections::VecDeque;
 
-const CHUNK_SIZE: usize = 60000; // Slightly less than the maximum UDP packet size
-const CHUNK_DELAY_MS: u64 = 2; // Small delay between chunks
-const TARGET_FPS: u64 = 30;
+const CHUNK_SIZE: usize = 512 * 1024; // Increased chunk size for faster sending
+const TARGET_FPS: u64 = 60;
 const FRAME_TIME_MS: u64 = 1000 / TARGET_FPS;
+const MIN_FRAME_TIME_MS: u64 = (FRAME_TIME_MS as f64 * 0.8) as u64; // Allow slightly faster frames
+const MAX_FRAME_LAG_MS: u64 = 8; // Keep aggressive frame dropping
 
 fn bgra_to_rgba(bgra: &[u8]) -> Vec<u8> {
     let mut rgba = Vec::with_capacity(bgra.len());
@@ -41,15 +43,28 @@ fn main() {
 
     println!("✅ Platform supported and permission granted");
 
-    // Setup UDP socket
-    let socket = Socket::new(Domain::IPV4, Type::DGRAM, None).unwrap();
+    // Setup TCP socket
+    let socket = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 12345);
     let sock_addr = SockAddr::from(addr);
-    println!("🎯 Streaming to {}", addr);
+    
+    // Try to connect to the server
+    println!("🔌 Connecting to {}", addr);
+    match socket.connect(&sock_addr) {
+        Ok(_) => println!("✅ Connected to server"),
+        Err(e) => {
+            println!("❌ Failed to connect: {:?}", e);
+            return;
+        }
+    }
+
+    // Set TCP socket options for better performance
+    socket.set_nodelay(true).unwrap(); // Disable Nagle's algorithm
+    socket.set_send_buffer_size(1024 * 1024).unwrap(); // 1MB send buffer
 
     // Create Options for screen capture
     let options = Options {
-        fps: TARGET_FPS as u32,
+        fps: 0, // 0 means capture as fast as possible
         target: None, // None captures the primary display
         show_cursor: true,
         show_highlight: false,
@@ -66,7 +81,7 @@ fn main() {
         ..Default::default()
     };
 
-    println!("⚙️ Capture settings: 1280x720 @ {}fps", TARGET_FPS);
+    println!("⚙️ Capture settings: 1280x720 @ {}fps (max)", TARGET_FPS);
 
     // Create Capturer
     let mut capturer = match Capturer::build(options) {
@@ -94,8 +109,11 @@ fn main() {
     io::stdout().flush().unwrap();
 
     let mut frame_count = 0;
+    let mut dropped_frames = 0;
     let mut last_fps_print = Instant::now();
-    let mut frame_times = Vec::with_capacity(TARGET_FPS as usize);
+    let mut last_frame_time = Instant::now();
+    let mut current_frame: Option<Vec<u8>> = None;
+    let mut is_sending = false;
 
     // Capture and stream frames
     loop {
@@ -107,94 +125,105 @@ fn main() {
             break;
         }
 
-        match capturer.get_next_frame() {
-            Ok(frame) => {
-                // Get the raw bytes from the frame and convert to RGBA
-                let bgra_data = match frame {
-                    scap::frame::Frame::BGRA(bgra) => bgra.data,
-                    _ => {
-                        println!("\n❌ Unexpected frame format");
+        // If we're not currently sending, try to get a new frame
+        if !is_sending {
+            match capturer.get_next_frame() {
+                Ok(frame) => {
+                    // Get the raw bytes from the frame and convert to RGBA
+                    let bgra_data = match frame {
+                        scap::frame::Frame::BGRA(bgra) => bgra.data,
+                        _ => {
+                            println!("\n❌ Unexpected frame format");
+                            continue;
+                        }
+                    };
+
+                    // Check if we should drop this frame
+                    let frame_time = frame_start.duration_since(last_frame_time).as_millis() as u64;
+                    if frame_time < MIN_FRAME_TIME_MS {
+                        dropped_frames += 1;
                         continue;
                     }
-                };
-                
-                let rgba_data = bgra_to_rgba(&bgra_data);
-                
-                // Send frame metadata
-                let total_size = rgba_data.len() as u32;
-                let num_chunks = ((total_size as usize + CHUNK_SIZE - 1) / CHUNK_SIZE) as u32;
-                let metadata = [
-                    total_size.to_le_bytes(),
-                    num_chunks.to_le_bytes(),
-                ].concat();
-                
-                if let Err(e) = socket.send_to(&metadata, &sock_addr) {
-                    println!("\n❌ Error sending metadata: {:?}", e);
+
+                    // Convert and store the frame
+                    current_frame = Some(bgra_to_rgba(&bgra_data));
+                    is_sending = true;
+                }
+                Err(e) => {
+                    println!("\n❌ Error getting frame: {:?}", e);
                     continue;
                 }
+            }
+        }
 
-                // Debug first frame
-                if frame_count == 0 {
-                    println!("First frame: size={}, chunks={}, metadata_size={}", 
-                        total_size, num_chunks, metadata.len());
-                }
+        // Try to send the current frame
+        if let Some(frame_data) = current_frame.take() {
+            // Send frame metadata
+            let total_size = frame_data.len() as u32;
+            let num_chunks = ((total_size as usize + CHUNK_SIZE - 1) / CHUNK_SIZE) as u32;
+            let metadata = [
+                total_size.to_le_bytes(),
+                num_chunks.to_le_bytes(),
+            ].concat();
+            
+            if let Err(e) = socket.send(&metadata) {
+                println!("\n❌ Connection error: {:?}", e);
+                break;
+            }
 
-                // Send the frame data in chunks
-                for (chunk_index, chunk) in rgba_data.chunks(CHUNK_SIZE).enumerate() {
-                    // Create chunk data with index prefix
-                    let index_bytes = (chunk_index as u32).to_le_bytes();
-                    let mut chunk_data = Vec::with_capacity(4 + chunk.len());
-                    chunk_data.extend_from_slice(&index_bytes);
-                    chunk_data.extend_from_slice(chunk);
-
-                    // Debug first chunk of first frame
-                    if frame_count == 0 && chunk_index == 0 {
-                        println!("First chunk: index={}, header_size={}, data_size={}, total_size={}", 
-                            chunk_index, index_bytes.len(), chunk.len(), chunk_data.len());
-                    }
-
-                    if let Err(e) = socket.send_to(&chunk_data, &sock_addr) {
-                        println!("\n❌ Error sending chunk {}: {:?}", chunk_index, e);
-                        break;
-                    }
-
-                    // Add a small delay between chunks to avoid overwhelming the receiver
-                    sleep(Duration::from_millis(CHUNK_DELAY_MS));
-                }
-
-                frame_count += 1;
-
-                // Calculate frame time and FPS
-                let frame_time = frame_start.elapsed();
-                frame_times.push(frame_time);
-                if frame_times.len() > TARGET_FPS as usize {
-                    frame_times.remove(0);
-                }
-
-                // Print FPS every second
-                if last_fps_print.elapsed().as_secs() >= 1 {
-                    let avg_frame_time = frame_times.iter().sum::<Duration>() / frame_times.len() as u32;
-                    let current_fps = 1.0 / avg_frame_time.as_secs_f64();
-                    print!("\r🎬 Capture FPS: {:.1} (avg frame time: {:.1}ms)    ", 
-                        current_fps, avg_frame_time.as_millis() as f64);
-                    io::stdout().flush().unwrap();
-                    
-                    last_fps_print = Instant::now();
-                }
-
-                // Maintain target FPS
-                let frame_duration = frame_start.elapsed().as_millis() as u64;
-                if frame_duration < FRAME_TIME_MS {
-                    sleep(Duration::from_millis(FRAME_TIME_MS - frame_duration));
+            // Send the frame data in chunks
+            let mut send_error = false;
+            for chunk in frame_data.chunks(CHUNK_SIZE) {
+                // Send chunk size and data together
+                let chunk_size = chunk.len() as u32;
+                let mut chunk_data = Vec::with_capacity(4 + chunk.len());
+                chunk_data.extend_from_slice(&chunk_size.to_le_bytes());
+                chunk_data.extend_from_slice(chunk);
+                
+                if let Err(e) = socket.send(&chunk_data) {
+                    println!("\n❌ Connection error: {:?}", e);
+                    send_error = true;
+                    break;
                 }
             }
-            Err(e) => {
-                println!("\n❌ Error getting frame: {:?}", e);
+            
+            if send_error {
+                break;
             }
+
+            frame_count += 1;
+            last_frame_time = Instant::now();
+            is_sending = false;
+
+            // Print FPS and stats every second
+            if last_fps_print.elapsed().as_secs() >= 1 {
+                let current_fps = frame_count as f64 / last_fps_print.elapsed().as_secs_f64();
+                let total_frames = frame_count + dropped_frames;
+                let drop_rate = (dropped_frames as f64 / total_frames as f64) * 100.0;
+                let latency = frame_start.elapsed().as_millis() as f64;
+                
+                print!("\r🎬 FPS: {:.1} | Latency: {:.1}ms | Dropped: {}/{} ({:.1}%)    ", 
+                    current_fps,
+                    latency,
+                    dropped_frames,
+                    total_frames,
+                    drop_rate);
+                io::stdout().flush().unwrap();
+                
+                frame_count = 0;
+                dropped_frames = 0;
+                last_fps_print = Instant::now();
+            }
+        }
+
+        // Only sleep if we're ahead by a significant margin
+        let frame_duration = frame_start.elapsed().as_millis() as u64;
+        if frame_duration + 2 < FRAME_TIME_MS {  // Leave 2ms margin
+            sleep(Duration::from_millis(FRAME_TIME_MS - frame_duration - 2));
         }
     }
 
     // Stop Capture
     capturer.stop_capture();
-    println!("👋 Capture stopped after {} frames", frame_count);
+    println!("\n👋 Capture stopped");
 }

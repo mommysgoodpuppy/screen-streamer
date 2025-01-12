@@ -23,176 +23,108 @@ gl.ClearColor(0.2, 0.3, 0.3, 1.0);
 gl.Enable(gl.BLEND);
 gl.BlendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
 
-// UDP setup
-const listener = Deno.listenDatagram({
+// Constants
+const CHUNK_SIZE = 512 * 1024; // Match Rust's chunk size
+const METADATA_SIZE = 8;  // 4 bytes for total size + 4 bytes for chunk count
+const FRAME_TIMEOUT_MS = 1000; // Timeout for receiving a frame
+
+// TCP setup
+const listener = Deno.listen({
     port: 12345,
-    transport: "udp",
     hostname: "127.0.0.1",
 });
 
-// Frame reconstruction state
-let currentFrameData: Uint8Array | null = null;
-let expectedChunks = 0;
-let receivedChunks: Map<number, Uint8Array> = new Map();
-let totalFrameSize = 0;
+console.log("Waiting for TCP connection...");
+const conn = await listener.accept();
+console.log("Connected!");
+
+// Frame state
 let frameCount = 0;
+let lastFrameTime = performance.now();
+let minLatency = Number.MAX_VALUE;
+let maxLatency = 0;
+let totalLatency = 0;
 
-// Constants
-const CHUNK_SIZE = 60000; // Must match Rust's CHUNK_SIZE
-const METADATA_SIZE = 8;  // 4 bytes for total size + 4 bytes for chunk count
-const CHUNK_HEADER_SIZE = 4; // 4 bytes for chunk index
+async function readExactly(conn: Deno.Conn, size: number): Promise<Uint8Array | null> {
+    const buffer = new Uint8Array(size);
+    let totalRead = 0;
+    
+    const startTime = performance.now();
+    while (totalRead < size) {
+        // Check for timeout
+        if (performance.now() - startTime > FRAME_TIMEOUT_MS) {
+            throw new Error("Timeout while reading data");
+        }
 
-function extractChunksFromPacket(packet: Uint8Array): { index: number, data: Uint8Array }[] {
-    const chunks: { index: number, data: Uint8Array }[] = [];
-    let offset = 0;
-
-    while (offset < packet.length) {
-        // Need at least 4 bytes for the chunk index
-        if (offset + CHUNK_HEADER_SIZE > packet.length) break;
-
-        // Extract chunk index
-        const index = new DataView(packet.buffer, packet.byteOffset + offset, 4).getUint32(0, true);
-        offset += CHUNK_HEADER_SIZE;
-
-        // Calculate remaining data in packet
-        const remainingBytes = packet.length - offset;
-        if (remainingBytes <= 0) break;
-
-        // Extract chunk data
-        const chunkSize = Math.min(remainingBytes, CHUNK_SIZE);
-        const data = new Uint8Array(packet.buffer, packet.byteOffset + offset, chunkSize);
-        offset += chunkSize;
-
-        chunks.push({ index, data });
+        const bytesRead = await conn.read(buffer.subarray(totalRead));
+        if (!bytesRead) return null; // Connection closed
+        totalRead += bytesRead;
     }
-
-    return chunks;
+    
+    return buffer;
 }
 
 async function receiveFrame(): Promise<Uint8Array | null> {
     try {
-        // Wait for metadata packet
-        console.log("Waiting for metadata packet...");
-        const [metadata, _] = await listener.receive();
-        if (!metadata || metadata.length < METADATA_SIZE) {
-            console.log("Invalid metadata received");
-            return null;
+        // Check if we've waited too long for a frame
+        if (performance.now() - lastFrameTime > FRAME_TIMEOUT_MS) {
+            throw new Error("Frame timeout - connection may be dead");
+        }
+
+        // Read metadata
+        const metadataBuffer = await readExactly(conn, METADATA_SIZE);
+        if (!metadataBuffer) {
+            throw new Error("Connection closed while reading metadata");
         }
         
         // Parse metadata
-        const totalSize = new DataView(metadata.buffer).getUint32(0, true);
-        const numChunks = new DataView(metadata.buffer).getUint32(4, true);
+        const totalSize = new DataView(metadataBuffer.buffer).getUint32(0, true);
+        const numChunks = new DataView(metadataBuffer.buffer).getUint32(4, true);
 
         if (numChunks > 1000 || totalSize > 1920 * 1080 * 4) {
-            console.log(`Invalid metadata: size=${totalSize}, chunks=${numChunks}`);
-            // Reset socket buffer
-            while (await listener.receive()) {}
-            return null;
+            throw new Error(`Invalid frame size: ${totalSize} bytes, ${numChunks} chunks`);
         }
-
-        console.log(`Frame ${frameCount}: Expecting ${totalSize} bytes in ${numChunks} chunks`);
-        console.log("Starting to receive chunks...");
 
         // Create buffer for the entire frame
         const frameData = new Uint8Array(totalSize);
-        const receivedChunks = new Set<number>();
         let totalReceived = 0;
 
-        // Receive all chunks with timeout
-        const startTime = performance.now();
-        const TIMEOUT = 1000; // 1 second timeout
-
-        while (receivedChunks.size < numChunks) {
-            if (performance.now() - startTime > TIMEOUT) {
-                console.log(`Frame ${frameCount}: Timeout waiting for chunks`);
-                // Reset socket buffer
-                while (await listener.receive()) {}
-                return null;
+        // Read all chunks
+        for (let i = 0; i < numChunks; i++) {
+            // Read combined chunk header and data
+            const chunkHeader = await readExactly(conn, 4);
+            if (!chunkHeader) {
+                throw new Error("Connection closed while reading chunk header");
             }
-
-            const [packetData, _] = await listener.receive();
-            if (!packetData || packetData.length < CHUNK_HEADER_SIZE) continue;
-
-            // Extract all chunks from the packet
-            const chunks = extractChunksFromPacket(packetData);
             
-            for (const { index: chunkIndex, data: chunkData } of chunks) {
-                if (chunkIndex >= numChunks) {
-                    console.log(`Invalid chunk index: ${chunkIndex} >= ${numChunks}`);
-                    continue;
-                }
-
-                // Debug log for first chunk of each frame
-                if (chunkIndex === 0) {
-                    console.log(`First chunk: index=${chunkIndex}, size=${chunkData.length}`);
-                }
-
-                if (!receivedChunks.has(chunkIndex)) {
-                    const offset = chunkIndex * CHUNK_SIZE;
-                    const expectedSize = Math.min(CHUNK_SIZE, totalSize - offset);
-                    
-                    if (chunkData.length > expectedSize) {
-                        console.log(`Warning: Chunk ${chunkIndex} is too large (${chunkData.length} > ${expectedSize})`);
-                        continue;
-                    }
-
-                    frameData.set(chunkData, offset);
-                    receivedChunks.add(chunkIndex);
-                    totalReceived += chunkData.length;
-
-                    // Progress logging
-                    if (receivedChunks.size % 10 === 0) {
-                        console.log(`Progress: ${receivedChunks.size}/${numChunks} chunks`);
-                    }
-                }
+            const chunkSize = new DataView(chunkHeader.buffer).getUint32(0, true);
+            if (chunkSize > CHUNK_SIZE || chunkSize > (totalSize - totalReceived)) {
+                throw new Error(`Invalid chunk size: ${chunkSize}`);
             }
+
+            // Read chunk data
+            const chunkData = await readExactly(conn, chunkSize);
+            if (!chunkData) {
+                throw new Error("Connection closed while reading chunk data");
+            }
+
+            frameData.set(chunkData, totalReceived);
+            totalReceived += chunkSize;
         }
 
         if (totalReceived !== totalSize) {
-            console.log(`Frame ${frameCount}: Size mismatch, received ${totalReceived}/${totalSize} bytes`);
-            return null;
+            throw new Error(`Size mismatch: ${totalReceived} != ${totalSize}`);
         }
 
-        // Debug log for first pixel
-        console.log(`First pixel: R=${frameData[0]}, G=${frameData[1]}, B=${frameData[2]}, A=${frameData[3]}`);
-
         frameCount++;
+        lastFrameTime = performance.now();
         return frameData;
     } catch (error) {
-        console.error("Error receiving frame:", error);
-        return null;
+        console.error("Frame receive error:", error);
+        conn.close();
+        listener.close();
+        throw error; // Re-throw to stop the rendering loop
     }
-}
-
-function loadShader(type: number, src: string) {
-    const shader = gl.CreateShader(type);
-    gl.ShaderSource(
-        shader,
-        1,
-        new Uint8Array(
-            new BigUint64Array([
-                BigInt(
-                    Deno.UnsafePointer.value(
-                        Deno.UnsafePointer.of(new TextEncoder().encode(src)),
-                    ),
-                ),
-            ]).buffer,
-        ),
-        new Int32Array([src.length]),
-    );
-    gl.CompileShader(shader);
-    const status = new Int32Array(1);
-    gl.GetShaderiv(shader, gl.COMPILE_STATUS, status);
-    if (status[0] === gl.FALSE) {
-        const logLength = new Int32Array(1);
-        gl.GetShaderiv(shader, gl.INFO_LOG_LENGTH, logLength);
-        const log = new Uint8Array(logLength[0]);
-        gl.GetShaderInfoLog(shader, logLength[0], logLength, log);
-        console.log("Shader compilation error:", new TextDecoder().decode(log));
-        gl.DeleteShader(shader);
-        return 0;
-    }
-    return shader;
 }
 
 // Simple vertex shader
@@ -298,54 +230,104 @@ function createTextureFromScreenshot(pixels: Uint8Array): number {
     return texture[0];
 }
 
+function loadShader(type: number, src: string) {
+    const shader = gl.CreateShader(type);
+    gl.ShaderSource(
+        shader,
+        1,
+        new Uint8Array(
+            new BigUint64Array([
+                BigInt(
+                    Deno.UnsafePointer.value(
+                        Deno.UnsafePointer.of(new TextEncoder().encode(src)),
+                    ),
+                ),
+            ]).buffer,
+        ),
+        new Int32Array([src.length]),
+    );
+    gl.CompileShader(shader);
+    const status = new Int32Array(1);
+    gl.GetShaderiv(shader, gl.COMPILE_STATUS, status);
+    if (status[0] === gl.FALSE) {
+        const logLength = new Int32Array(1);
+        gl.GetShaderiv(shader, gl.INFO_LOG_LENGTH, logLength);
+        const log = new Uint8Array(logLength[0]);
+        gl.GetShaderInfoLog(shader, logLength[0], logLength, log);
+        console.log("Shader compilation error:", new TextDecoder().decode(log));
+        gl.DeleteShader(shader);
+        return 0;
+    }
+    return shader;
+}
+
 // Frame timing state
 let lastFpsUpdate = performance.now();
 let framesThisSecond = 0;
 let currentFps = 0;
 
 async function frame() {
-    const frameStart = performance.now();
-    
-    // Receive new frame data
-    const frameData = await receiveFrame();
-    
-    if (frameData) {
-        currentTexture = createTextureFromScreenshot(frameData);
-    }
-    
-    // Clear and draw
-    gl.Clear(gl.COLOR_BUFFER_BIT);
-    
-    if (currentTexture !== null) {
-        gl.UseProgram(program);
+    try {
+        const frameStart = performance.now();
         
-        // Set up position attribute
-        gl.VertexAttribPointer(positionLoc, 2, gl.FLOAT, gl.FALSE, 0, positions);
-        gl.EnableVertexAttribArray(positionLoc);
+        // Receive new frame data
+        const frameData = await receiveFrame();
         
-        // Set up texture coordinate attribute
-        gl.VertexAttribPointer(texCoordLoc, 2, gl.FLOAT, gl.FALSE, 0, texCoords);
-        gl.EnableVertexAttribArray(texCoordLoc);
+        if (frameData) {
+            currentTexture = createTextureFromScreenshot(frameData);
         
-        // Bind texture
-        gl.ActiveTexture(gl.TEXTURE0);
-        gl.BindTexture(gl.TEXTURE_2D, currentTexture);
-        
-        // Draw fullscreen quad
-        gl.DrawArrays(gl.TRIANGLE_STRIP, 0, 4);
-    }
-    
-    window.swapBuffers();
+            // Clear and draw
+            gl.Clear(gl.COLOR_BUFFER_BIT);
+            
+            gl.UseProgram(program);
+            
+            // Set up position attribute
+            gl.VertexAttribPointer(positionLoc, 2, gl.FLOAT, gl.FALSE, 0, positions);
+            gl.EnableVertexAttribArray(positionLoc);
+            
+            // Set up texture coordinate attribute
+            gl.VertexAttribPointer(texCoordLoc, 2, gl.FLOAT, gl.FALSE, 0, texCoords);
+            gl.EnableVertexAttribArray(texCoordLoc);
+            
+            // Bind texture
+            gl.ActiveTexture(gl.TEXTURE0);
+            gl.BindTexture(gl.TEXTURE_2D, currentTexture);
+            
+            // Draw fullscreen quad
+            gl.DrawArrays(gl.TRIANGLE_STRIP, 0, 4);
+            
+            window.swapBuffers();
+        }
 
-    // Update FPS counter
-    framesThisSecond++;
-    
-    const now = performance.now();
-    if (now - lastFpsUpdate >= 1000) {
-        currentFps = framesThisSecond;
-        console.log(`🎬 Display FPS: ${currentFps} (frame time: ${((now - frameStart) / framesThisSecond).toFixed(1)}ms)`);
-        framesThisSecond = 0;
-        lastFpsUpdate = now;
+        // Update FPS counter
+        framesThisSecond++;
+        
+        const now = performance.now();
+        if (now - lastFpsUpdate >= 1000) {
+            currentFps = framesThisSecond;
+            const frameTime = (now - frameStart) / framesThisSecond;
+            const latency = now - lastFrameTime;
+            
+            // Update latency stats
+            minLatency = Math.min(minLatency, latency);
+            maxLatency = Math.max(maxLatency, latency);
+            totalLatency += latency;
+            const avgLatency = totalLatency / frameCount;
+
+            console.log(
+                `Display FPS: ${currentFps} | ` +
+                `Frame time: ${frameTime.toFixed(1)}ms | ` +
+                `Latency: ${latency.toFixed(1)}ms (min: ${minLatency.toFixed(1)}, ` +
+                `avg: ${avgLatency.toFixed(1)}, max: ${maxLatency.toFixed(1)})`
+            );
+            
+            framesThisSecond = 0;
+            lastFpsUpdate = now;
+        }
+    } catch (error) {
+        console.error("Fatal error in render loop:", error);
+        cleanup();
+        throw error; // Stop the render loop
     }
 }
 
@@ -358,6 +340,7 @@ function cleanup() {
     gl.DeleteProgram(program);
     gl.DeleteShader(vShader);
     gl.DeleteShader(fShader);
+    conn.close();
     listener.close();
 }
 
