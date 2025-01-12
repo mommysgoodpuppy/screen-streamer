@@ -133,9 +133,7 @@ fn main() {
           };
 
           // Check if we should drop this frame
-          if (frame_start.duration_since(last_frame_time).as_millis() as u64)
-            < FRAME_TIME_MS
-          {
+          if (frame_start.duration_since(last_frame_time).as_millis() as u64) < FRAME_TIME_MS {
             dropped_frames += 1;
             continue;
           }
