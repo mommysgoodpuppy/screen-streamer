@@ -167,6 +167,7 @@ let framesThisSecond = 0;
 let currentFps = 0;
 
 async function frame() {
+  await new Promise(resolve => setTimeout(resolve, 100));
   const frameStart = performance.now();
 
   // Get latest frame from capturer
@@ -200,7 +201,7 @@ async function frame() {
   }
 
   // Add small delay to prevent thread starvation
-  await new Promise(resolve => setTimeout(resolve, 1));
+
 
   // Update FPS counter
   framesThisSecond++;
